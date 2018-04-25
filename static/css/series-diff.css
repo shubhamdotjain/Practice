@@ -1,0 +1,87 @@
+.diff {
+  width: 100%;
+  table-layout: fixed;
+  margin-top: 1em;
+  border: 1px solid #999;
+}
+.diff th, .diff td {
+  width: 50%;
+  border: 1px solid #999;
+  vertical-align: top;
+}
+.diff thead th, .diff thead td {
+  background: #ddd;
+}
+.diff.trivial thead th {
+  color: #999;
+}
+.diff tbody td {
+  border-bottom-color: #ddd;
+}
+
+.diff div {
+  overflow-x: hidden;
+  white-space: pre;
+}
+
+.diff thead th {
+  cursor: pointer;
+}
+
+/* Hide line numbers since we already have them in the diff.  */
+.diff th {
+  display: none;
+  vertical-align: middle;
+}
+.diff th.author {
+  display: table-cell;
+}
+.diff th.texttitle {
+  display: table-cell;
+}
+
+/* Colors for the body of the diff */
+.diff td.delete, .diff td.replace.left {
+  border-bottom-color: #ebb;
+  background: #fcc;
+}
+.diff td.insert, .diff td.replace.right {
+  border-bottom-color: #beb;
+  background: #cfc;
+}
+.diff td.equal {
+  border-bottom-color: #eee;
+  background: #fff;
+}
+.diff td.empty {
+  border-bottom-color: #ddd;
+  background: #eee;
+}
+.diff td.skip {
+  background-color: #f3f3ff;
+  border-bottom: 1px solid #cce;
+  padding: 0;
+}
+.diff td.skip div {
+  /* Use a top border on the div to "bypass" the table's collapsed borders.  */
+  border-top: 1px solid #cce;
+  height: 6px;
+  text-align: center;
+  padding: 0;
+}
+
+.diff th.texttitle > div {
+    padding: 0em 0em 0em 2em;
+}
+
+.diff th.texttitle > div.patch-link {
+    margin: 0.3em 0em;
+    padding: 0em;
+}
+.diff th.texttitle > div.patch-link .fa {
+    position: relative;
+    color: #337ab7;
+    width: 1.5em;
+    text-align: center;
+    display: inline-block;
+}

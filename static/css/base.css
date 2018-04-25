@@ -1,0 +1,182 @@
+html, body {
+    height: 100%;
+}
+textarea {
+    font-family: monospace;
+}
+samp {
+    padding: 2px 4px;
+    font-size: 90%;
+    background-color: #eeeeee;
+    border-radius: 4px;
+}
+.wrapper {
+    min-height: 100%;
+    height: auto !important;
+    height: 100%;
+    margin: 0 auto -40px; /* the bottom margin is the negative value of the footer's height */
+}
+.footer, .push {
+    height: 40px; /* .push must be the same height as .footer */
+}
+.footer {
+    text-align: center;
+    color: #888;
+}
+.footer p {
+    margin-bottom: 0;
+}
+.smiley {
+    color: #008900;
+}
+
+#message {
+    text-align: center;
+    font-weight: bold;
+    font-size: 28px;
+}
+
+.navbar-brand {
+    font-size: 28px;
+    font-weight: bold;
+}
+
+.navbar {
+    border: 0px 0px 1px 0px;
+    border-radius: 0px;
+    background: none;
+    padding: 3px 3px 5px 3px;
+}
+
+.breadcrumb {
+    margin-bottom: 0px;
+}
+
+h1, h2, h3, .h1, .h2, .h3 {
+    margin-top: 15px;
+}
+
+.navbar-default .navbar-nav > .open > a, .navbar-default .navbar-nav > .open > a:focus, .navbar-default .navbar-nav > .open > a:hover {
+    background: none;
+}
+
+.navigate > .active a {
+    text-decoration: none;
+    color: #666;
+}
+
+.search-help {
+    color: #ccc;
+}
+
+.search-help:hover {
+    color: #aaa;
+}
+
+.search-form .form-group {
+    width: 600px;
+}
+
+.search-form .form-control {
+    width: 100%;
+}
+
+.user-button {
+    margin: 8px 0px 8px 0px;
+}
+
+.panel-toggler {
+    cursor: pointer;
+}
+.panel-body {
+    padding-top: 5px;
+    padding-bottom: 5px;
+}
+.panel-hidden {
+    display: none;
+}
+.panel-body pre {
+    background-color: #fff;
+    border: none;
+    padding: 5px;
+}
+
+#pre-fixed {
+    margin-top: 1em;
+    clear: both;
+}
+@media (min-width: 1200px) {
+  .fixed {
+    position: fixed;
+    top: 10px;
+    padding-left: 0px;
+    padding-right: 35px;
+  }
+}
+
+.status {
+    padding-right: 15px;
+}
+.status .status-content:last-child {
+    border-bottom: 0px;
+    margin-bottom: 15px;
+}
+.status-content {
+    border-bottom: 1px solid #dddddd;
+    padding-bottom: 0.5em;
+    margin: 0.5em 0em;
+}
+
+.status-content > .fa {
+    position: absolute;
+    width: 40px;
+    margin-top: 0.166666em;
+    text-align: center;
+}
+
+.status-content > .fa {
+    color: #337ab7;
+}
+.status-content.status-alert > .fa {
+    color: #CC0000;
+}
+.status-content.status-good > .fa {
+    color: #009900;
+}
+.status-content > div {
+    margin-left: 40px;
+}
+
+@media (min-width: 1200px) {
+  #detail-ops {
+    clear: right;
+    float: right;
+    padding-left: 15px;
+    padding-bottom: 15px;
+    background-color: white;
+  }
+}
+#detail-ops {
+  padding-bottom: 15px;
+  padding-right: 15px;
+}
+
+#detail-ops > ul {
+    list-style-type: none;
+    color: #1708f;
+    background-color: #d9edf7;
+    border-radius: 4px;
+    padding: 0px 1em 0px 2em;
+    border: 1px solid #dddddd;
+}
+#detail-ops > ul > li {
+    margin: 1em 0.5em;
+    padding: 0em;
+}
+#detail-ops > ul > li > .fa {
+    position: relative;
+    left: -1em;
+    width: 1em;
+    text-align: center;
+    display: inline-block;
+}

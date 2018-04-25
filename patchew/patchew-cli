@@ -1,0 +1,863 @@
+#!/usr/bin/env python3
+#
+# Copyright 2016 Red Hat, Inc.
+#
+# Authors:
+#     Fam Zheng <famz@redhat.com>
+#
+# This work is licensed under the MIT License.  Please see the LICENSE file or
+# http://opensource.org/licenses/MIT.
+
+import logging
+import os
+import sys
+import argparse
+import configparser
+import json
+import urllib.request, urllib.parse, urllib.error
+import http.cookiejar
+import subprocess
+import tempfile
+import shutil
+import traceback
+import time
+import hashlib
+import fcntl
+
+COOKIE_FILENAME = os.path.expanduser("~/.patchew.cookie")
+
+class APIError(Exception):
+    pass
+
+def git_clone_repo(clone, remote, head, logf, checkout=True, recursive=False):
+    cache_repo = os.path.join(os.path.expanduser("~/.cache/patchew-git-cache"),
+                              "".join([x for x in remote if x.isalnum()]) + "-" + \
+                                      hashlib.sha1(remote.encode("utf-8")).hexdigest())
+    if not os.path.isdir(cache_repo) or not os.listdir(cache_repo):
+        # Clone upstream to local cache
+        subprocess.check_call(["mkdir", "-p", cache_repo])
+        subprocess.check_output(["git", "init", "--bare",
+                                 cache_repo])
+    remote_name = hashlib.sha1(remote.encode("utf-8")).hexdigest()
+    subprocess.call(["git", "remote", "remove", remote_name],
+                    cwd=cache_repo,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE)
+    subprocess.check_call(["git", "remote", "add", "-f", "--mirror=fetch",
+                          remote_name, remote], cwd=cache_repo,
+                          stdout=logf, stderr=logf)
+    clone_cmd = ["git", "clone", "-q"]
+    if recursive:
+        clone_cmd += ["--recursive"]
+    clone_cmd += [cache_repo, clone]
+    subprocess.check_call(clone_cmd, stderr=logf, stdout=logf)
+    if checkout:
+        subprocess.check_call(["git", "checkout", head, "-b", "test"],
+                              stderr=logf, stdout=logf,
+                              cwd=clone)
+
+class SubCommand(object):
+    """ Base class of subcommand"""
+    help = ""
+    want_argv = False # Whether the command accepts extra arguments
+
+    def api_do(self, cmd, **data):
+        """Do server api call"""
+        logging.debug("API call '%s':" % cmd)
+        logging.debug("data:\n%s" % data)
+        cookie = http.cookiejar.MozillaCookieJar(COOKIE_FILENAME)
+        try:
+            cookie.load()
+        except IOError:
+            pass
+        except http.cookiejar.LoadError:
+            print("Error while loading cookie", COOKIE_FILENAME)
+            pass
+        handler = urllib.request.HTTPCookieProcessor(cookie)
+        opener = urllib.request.build_opener(handler)
+        url = self.base_url + "/api/" + cmd + "/"
+        if data:
+            post_data = urllib.parse.urlencode({"params": json.dumps(data)})
+        else:
+            post_data = ""
+        req = urllib.request.Request(url, data=bytes(post_data, encoding="utf-8"))
+        # insert data
+        resp = opener.open(req)
+        cookie.save(ignore_discard=True, ignore_expires=True)
+        respdata = resp.read()
+        logging.debug("Server response:\n%s" % (respdata or "<empty>"))
+        if respdata:
+            r = json.loads(respdata.decode("utf-8"))
+        else:
+            r = None
+        return r
+
+    def do(self, args, argv):
+        """Do command"""
+        print("Not implemented")
+
+class LoginCommand(SubCommand):
+    name = "login"
+
+    def arguments(self, parser):
+        parser.add_argument("username", type=str, help="username for login")
+        parser.add_argument("password", nargs="?",
+                            type=str, help="password for login")
+
+    def do(self, args, argv):
+        import getpass
+        try:
+            if not args.password:
+                args.password = getpass.getpass("Password: ")
+            if not args.password:
+                return 1
+            self.api_do("login", username=args.username,
+                                 password=args.password)
+        except Exception as e:
+            print("Login failed:", e)
+            return 1
+        return 0
+
+class LogoutCommand(SubCommand):
+    name = "logout"
+
+    def do(self, args, argv):
+        self.api_do("logout")
+        return 0
+
+class APICommand(SubCommand):
+    name = "api"
+
+    def arguments(self, parser):
+        parser.add_argument("method", type=str)
+
+    def do(self, args, argv):
+        self.api_do(args.method)
+        return 0
+
+class DeleteCommand(SubCommand):
+    name = "delete"
+    want_argv = True
+
+    def arguments(self, parser):
+        parser.add_argument("--all", "-a", action="store_true",
+                            help="Delete all messages")
+
+    def do(self, args, argv):
+        if not argv and not args.all:
+            print("Must specify --all to delete all patches")
+            return 1
+        self.api_do("delete", terms=argv)
+        return 0
+
+class ImportCommand(SubCommand):
+    name = "import"
+    want_argv = True
+
+    def arguments(self, parser):
+        parser.add_argument("file", nargs="*", type=str, help="object to list")
+        parser.add_argument("--known-flag-dir", "-k", type=str,
+                            help="""a directory to store "known flag files"
+                            to mark messages as 'imported' and skip them next time""")
+
+    def do(self, args, argv):
+        projects = set()
+        import mailbox, email
+
+        def call_import(mo):
+            ff = None
+            if args.known_flag_dir:
+                ff = os.path.join(args.known_flag_dir,
+                                  hashlib.sha1(mo["Message-ID"].encode('utf-8')).hexdigest())
+                if os.path.exists(ff):
+                    print("[OLD] " + mo["Subject"])
+                    return
+            print("[NEW] " + mo["Subject"])
+            r = self.api_do("import", mboxes=[mo.as_string()])
+            for p in r:
+                if p not in projects:
+                    projects.add(p)
+                    print(p)
+            if ff:
+                open(ff, "wb").close()
+
+        def import_one(fn):
+            if os.path.isdir(fn):
+                for p in os.listdir(fn):
+                    import_one(os.path.join(fn, p))
+                return
+            f = open(fn, "rb")
+            if f.readline().startswith(b"From "):
+                for m in mailbox.mbox(fn):
+                    try:
+                        call_import(m)
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as e:
+                        print("Error in importing:", m['subject'], str(e))
+            else:
+                f.seek(0)
+                mo = email.message_from_bytes(f.read())
+                call_import(mo)
+        r = 0
+        for f in args.file:
+            try:
+                import_one(f)
+            except:
+                print("Error in importing:", f)
+                traceback.print_exc()
+                r = 1
+                pass
+        return r
+
+class ProjectCommand(SubCommand):
+    name = "project"
+    want_argv = True
+
+    def list_projects(self, argv):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--raw", action="store_true",
+                            help="Show raw json string")
+        parser.add_argument("--verbose", "-v", action="store_true",
+                            help="Show details about projects")
+        args = parser.parse_args(argv)
+        r = self.api_do("get-projects")
+        if args.raw:
+            print(json.dumps(r, indent=2, separators=",:"))
+            return 0
+        for p in r:
+            print(p["name"])
+            if args.verbose:
+                for k, v in p.items():
+                    if k == "name":
+                        continue
+                    print("  %s: %s" % (k, v))
+        return 0
+
+    def show_project(self, argv):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("name", nargs="+",
+                            help="The name of project to show info")
+        args = parser.parse_args(argv)
+        r = self.api_do("get-projects")
+        for p in r:
+            if not p["name"] in args.name:
+                continue
+            if len(args.name) > 1:
+                print(p["name"])
+            for k, v in p.items():
+                if k == "name":
+                    continue
+                print("  %s: %s" % (k, v))
+        return 0
+
+    def add_project(self, argv):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("name", help="Name of the project")
+        parser.add_argument("--mailing-list", "-l", default="",
+                            help="Mailing list")
+        parser.add_argument("--url", "-u", default="",
+                            help="Project URL")
+        parser.add_argument("--git", "-g", default="",
+                            help="Project git repo")
+        parser.add_argument("--desc", "-d", default="",
+                            help="Project short discription")
+        args = parser.parse_args(argv)
+        self.api_do("add-project",
+                    name=args.name,
+                    mailing_list=args.mailing_list,
+                    url=args.url,
+                    git=args.git,
+                    description=args.desc)
+
+    def update_one_project(self, wd, project):
+        logging.info("Updating project '%s'", project["name"])
+        clone = os.path.join('/var/tmp/patchew-project-update', project["name"])
+        if " " in project["git"]:
+            repo, branch = project["git"].split(" ", 2)
+        else:
+            repo, branch = project["git"], "master"
+        if not os.path.isdir(clone):
+            subprocess.check_output(["git", "clone", "--mirror", repo, clone])
+        else:
+            subprocess.check_call(["git", "remote", "set-url", "origin", repo],
+                                  cwd=clone)
+            subprocess.check_call(["git", "fetch", "origin"], cwd=clone)
+        new_head = subprocess.check_output(["git", "rev-parse", branch],
+                                            cwd=clone).decode().strip()
+        logging.debug("new head: %s", new_head)
+        try:
+            old_head = project["properties"]["git.head"].strip()
+            if old_head == new_head:
+                logging.info("no change since last update")
+                return
+        except:
+            old_head = "%s~100" % new_head
+
+        try:
+            new_commits = subprocess.check_output(["git", "rev-list",
+                                                  "%s..%s" % (old_head, new_head)],
+                                                  cwd=clone).decode().splitlines()
+        except:
+            old_head = new_head
+            new_commits = [new_head]
+        logging.debug("old head: %s", old_head)
+        logging.debug("new commits: \n%s" % \
+                "\n".join(["  " + x for x in new_commits]))
+        output = subprocess.check_output("""git log --format=%%b %s..%s |
+                awk 'BEGIN{IGNORECASE=1} /^message-id:/{print}'
+                """% \
+                (old_head, new_head), shell=True, cwd=clone).decode()
+        msgids = [x[len("message-id:"):].strip() for x in output.splitlines()]
+        logging.debug("message ids: \n%s" % \
+                "\n".join(["  " + x for x in msgids]))
+        push_to = project["properties"].get("git.push_to")
+        if push_to:
+            try:
+                subprocess.check_call(["git", "push", "--force", push_to,
+                                       "%s:%s" % (new_head, branch)],
+                                      cwd=clone)
+            except Exception as e:
+                logging.warn("Failed to push the new head to patchew mirror: %s",
+                             str(e))
+        self.api_do("update-project-head", project=project["name"],
+                                           old_head=old_head,
+                                           new_head=new_head,
+                                           message_ids=msgids)
+
+    def update_project(self, argv):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--name", "-n", help="Name of the project")
+        args = parser.parse_args(argv)
+        projects = self.api_do("get-projects", name=args.name)
+        wd = tempfile.mkdtemp()
+        logging.debug("TMPDIR: %s", wd)
+        try:
+            for p in projects:
+                self.update_one_project(wd, p)
+        finally:
+            shutil.rmtree(wd)
+
+    def project_property(self, argv):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("name", help="Name of the project")
+        parser.add_argument("prop", nargs="?", help="Name of the property")
+        parser.add_argument("--delete", "-d", action="store_true",
+                            help="""delete the property with the given name.
+                            Must give a property name""")
+        parser.add_argument("value", nargs="?", help="Value of the property to set")
+        args = parser.parse_args(argv)
+        if not args.value and not args.delete:
+            # Get property and print them or the specified one
+            r = self.api_do("get-project-properties",
+                            project=args.name)
+            if not args.prop:
+                for k, v in iter(r.items()) if r else []:
+                    print(k, v)
+            else:
+                if r and args.prop in r:
+                    print(args.prop, r[args.prop])
+                else:
+                    print("Property Not found:", args.prop)
+                    if r and list(r.keys()):
+                        print("There are:", ", ".join(list(r.keys())))
+        else:
+            if args.delete:
+                args.value = None
+            # Set property
+            self.api_do("set-project-properties", project=args.name,
+                        properties={args.prop: args.value})
+
+    def do(self, args, argv):
+        if argv:
+            if argv[0] == "add":
+                return self.add_project(argv[1:])
+            elif argv[0] == "property":
+                return self.project_property(argv[1:])
+            elif argv[0] == "info":
+                return self.show_project(argv[1:])
+            elif argv[0] == "update":
+                return self.update_project(argv[1:])
+        return self.list_projects(argv)
+
+class SearchCommand(SubCommand):
+    name = "search"
+
+    def arguments(self, parser):
+        parser.add_argument("--output", "-o", default="subject", type=str,
+                            help="Output fields")
+        parser.add_argument("--raw", "-r", action="store_true",
+                            help="Output raw response")
+        parser.add_argument("term", nargs="*", type=str)
+
+    def do(self, args, argv):
+        r = self.api_do("search", terms=args.term, fields=args.output.split(','))
+        if not r:
+            return 0
+        if args.raw:
+            print(json.dumps(r, indent=2, separators=",:"))
+        else:
+            for x in r:
+                for a in args.output.split(","):
+                    print(x[a])
+        return 0
+
+class UntestCommand(SubCommand):
+    name = "untest"
+
+    def arguments(self, parser):
+        parser.add_argument("term", nargs="*", type=str)
+
+    def do(self, args, argv):
+        self.api_do("untest", terms=args.term)
+        return 0
+
+class SetPropertyCommand(SubCommand):
+    name = "set-property"
+    want_argv = True
+
+    def arguments(self, parser):
+        parser.add_argument("--project", "-p", required=True,
+                            help="Project name")
+        parser.add_argument("--message-id", "-m", required=True,
+                            help="Project name")
+        parser.add_argument("--file", action="store_true",
+                            help="Read property values from given file")
+        parser.add_argument("--json", action="store_true",
+                            help="Read property values as json")
+
+    def do(self, args, argv):
+        if not argv:
+            return 0
+        if len(argv) % 2:
+            print("Name and value unpaired:", argv[-1])
+        props = dict(list(zip(argv[::2], argv[1::2])))
+        if args.file:
+            props = dict([(k, open(v, "r").read()) for k, v in props.items()])
+        if args.json:
+            props = dict([(k, json.loads(v)) for k, v in props.items()])
+        self.api_do("set-properties", project=args.project,
+                    message_id=args.message_id,
+                    properties=props)
+        return 0
+
+class TesterCommand(SubCommand):
+    name = "tester"
+    want_argv = True
+
+    def arguments(self, parser):
+        parser.add_argument("--singleton", "-S", action="store_true",
+                            help="quit if another singleton mode tester is running")
+        parser.add_argument("--project", "-p", required=True,
+                            help="comma separated project names to run test")
+        parser.add_argument("--name", "-n",
+                            help="name of this tester (default is the logged in username)")
+        parser.add_argument("--num", "-N", type=int, default=0,
+                            help="max number of tests to run")
+        parser.add_argument("--no-clean-up", action="store_true",
+                            help="skip cleaning up after finish")
+        parser.add_argument("--no-wait", action="store_true",
+                            help="don't wait if nothing to test")
+
+    def _make_script(self, wd, name, content):
+        filename = os.path.join(wd, name)
+        tf = open(filename, "w", encoding="utf-8")
+        tf.write(content)
+        tf.close()
+        subprocess.check_output(["chmod", "+x", filename])
+        return filename
+
+    def _refresh_capabilities(self, project, name):
+        wd = tempfile.mkdtemp()
+        r = self.api_do("testing-capabilities",
+                        project=project,
+                        tester=name)
+        if not r:
+            return []
+        ret = []
+        for name, val in r.items():
+            script = self._make_script(wd, "probe", val)
+            try:
+                if 0 == subprocess.call(script,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE):
+                    ret.append(name)
+            except:
+                pass
+        return ret
+
+    def test_one(self, name, project, no_clean_up, capabilities):
+        r = self.api_do("testing-get", project=project, tester=name,
+                        capabilities=capabilities)
+        if not r:
+            return False
+        print("Running test '%s'" % r["test"]["name"])
+        if r["project"] != project:
+            return
+
+        wd = tempfile.mkdtemp(prefix="patchew-tester-tmp-", dir="/var/tmp/")
+        print("  Workdir:", wd)
+        print("  Project:", r["project"])
+        print("  Identity:", str(r["identity"]))
+        logf = open(os.path.join(wd, "log"), "w+", encoding="utf-8",
+                    errors="ignore")
+        test_cmd = r["test"]["script"]
+        script = r["test"]["script"].strip() + "\n"
+        test_script = self._make_script(wd, "run", script)
+        for k, v in r["identity"].items():
+            logf.write("%s: %s\n" % (k.capitalize(), v))
+        logf.write("\n")
+        logf.write("=== TEST SCRIPT BEGIN ===\n")
+        logf.write(script)
+        logf.write("=== TEST SCRIPT END ===\n")
+        logf.write("\n")
+        logf.flush()
+        rc = 1
+        is_timeout = False
+        try:
+            clone = os.path.join(wd, "src")
+            git_clone_repo(clone, r["repo"], r["head"], logf, True)
+            base = r["base"]
+            if base:
+                subprocess.check_call(["git", "branch", "base", base],
+                                      cwd=clone, stdout=logf, stderr=logf)
+                subprocess.check_call(["git", "log", "--oneline", "%s.." % (base)],
+                                      cwd=clone, stdout=logf, stderr=logf)
+            logf.write("\n")
+            logf.write("=== OUTPUT BEGIN ===\n")
+            logf.flush()
+            start_time = time.time()
+            tp = subprocess.Popen([test_script], cwd=clone,
+                                  stdout=logf, stderr=logf)
+            rc = None
+            timeout = r["test"]["timeout"]
+            while timeout <= 0 or time.time() - start_time < timeout:
+                rc = tp.poll()
+                if rc != None:
+                    break
+                time.sleep(0.1)
+            logf.write("=== OUTPUT END ===\n")
+            logf.write("\n")
+            if rc == None:
+                try:
+                    tp.terminate()
+                    start_time = time.time()
+                    while tp.poll() == None and time.time() - start_time < 10:
+                        time.sleep(0.1)
+                    tp.kill()
+                    tp.wait()
+                except Exception as e:
+                    traceback.print_exc(file=logf)
+                logf.write("Abort: command timeout (>%d seconds)" % timeout)
+                is_timeout = True
+            else:
+                logf.write("Test command exited with code: %d" % rc)
+            logf.flush()
+        except:
+            traceback.print_exc(file=logf)
+        finally:
+            passed = rc == 0
+            try:
+                try:
+                    logf.seek(0)
+                    log = logf.read()
+                except:
+                    log = "N/A. Internal error while reading log file\n"
+                print("  Result:", "Passed" if passed else "Failed")
+                logging.debug(log)
+                self.api_do("testing-report", project=r["project"],
+                                              identity=r["identity"],
+                                              test=r["test"]["name"],
+                                              tester=name,
+                                              head=r["head"],
+                                              base=r["base"],
+                                              passed=passed,
+                                              log=log,
+                                              is_timeout=is_timeout)
+                logf.close()
+            finally:
+                if not no_clean_up:
+                    shutil.rmtree(wd)
+            return True
+
+    def _check_singleton(self):
+        lockfile = os.path.expanduser("~/.patchew-tester.lock")
+        self._lockfile = open(lockfile, "w+")
+        try:
+            fcntl.flock(self._lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.stderr.write("Cannot lock " + lockfile + "\n")
+            sys.exit(1)
+
+    def do(self, args, argv):
+        # Make sure git works
+        if args.singleton:
+            self._check_singleton()
+        subprocess.check_output(["git", "version"])
+        count = 0
+        cap_refresh = 10
+        projects = [x.strip() for x in args.project.split(",") if len(x.strip())]
+        if not projects:
+            raise Exception("No project specified")
+        capabilities = {}
+        while True:
+            progress = False
+            for p in projects:
+                if count % cap_refresh == 0:
+                    for sp in projects:
+                        capabilities[sp] = self._refresh_capabilities(sp, args.name)
+                if self.test_one(args.name, p, args.no_clean_up,
+                                 capabilities=capabilities[p]):
+                    progress = True
+                    count += 1
+                if count == args.num:
+                    return 0
+            if not progress:
+                if args.no_wait:
+                    print("Nothing to test")
+                    return 0
+                print("No more work, having a rest...")
+                time.sleep(60)
+        return 0
+
+class ApplyFailedException(Exception):
+    pass
+
+class ApplyCommand(SubCommand):
+    name = "apply"
+
+    def arguments(self, parser):
+        parser.add_argument("term", nargs="*", type=str)
+        parser.add_argument("-C", dest="repo",
+                            help="The path to the git repo")
+        parser.add_argument("--any", "-a", action="store_true",
+                            help="""Apply any applicable series (e.g. the
+                            first) even if there are more than one matches""")
+        parser.add_argument("--signoff", "-s", action="store_true",
+                            help="""Sign off the applied patch""")
+        parser.add_argument("--branch", "-b",
+                            help="""Create a branch at current HEAD before
+                            applying, with '%%m' replaced with the series'
+                            message id""")
+        parser.add_argument("--force-branch", "-B",
+                            help="""Create a branch, overwrite even if a branch
+                            with the same name already exists, and point to
+                            current HEAD before applying, with '%%m' replaced
+                            with the series' message id""")
+        parser.add_argument("--tag", "-t",
+                            help="""Create a tag after applying, with '%%m'
+                            replaced with the series' message id. If a tag with
+                            the same name already exists, it will be
+                            updated""")
+        parser.add_argument("--applier-mode", action="store_true",
+                            help="""Useful for an applier worker of patchew.
+                            Clone and checkout a temporary repo, and apply the
+                            patch there. Implies --any, conflicts with -C, -b,
+                            -B and -t.""")
+
+    def _apply(self, repo, s, branch, force_branch, tag, logf=None,
+               signoff=False):
+        msgid = s["message-id"]
+        bn = None
+        if force_branch:
+            bn = force_branch
+            bo = "-B"
+        elif branch:
+            bn = branch
+            bo = "-b"
+        if bn:
+            bn = bn.replace("%m", msgid)
+            subprocess.check_call(["git", "checkout", bo, bn], cwd=repo,
+                                  stdout=logf, stderr=logf)
+        for p in s["patches"]:
+            patchf = tempfile.NamedTemporaryFile()
+            patchf.write(p["mbox"].encode('utf-8'))
+            patchf.flush()
+            if 0 != subprocess.call(["git", "am", "-m", "-3", patchf.name],
+                                    cwd=repo, stdout=logf, stderr=logf):
+                logf.flush()
+                logf.write("Failed to apply patch:\n%s" % p["subject"])
+                raise ApplyFailedException()
+            filter_cmd = ""
+            commit_message_lines = \
+                    subprocess.check_output(["git", "log", "-n", "1",
+                                             "--format=%b"], cwd=repo) \
+                                           .decode('utf-8').splitlines()
+            for t in set(p["properties"].get("tags", []) + \
+                         s["properties"].get("tags", [])):
+                if t in commit_message_lines:
+                    continue
+                filter_cmd += "echo '%s';" % t
+            if signoff:
+                # Signed-off-by of the user line goes last
+                name = subprocess.check_output(["git", "config", "user.name"])
+                email = subprocess.check_output(["git", "config", "user.email"])
+                if not (name and email):
+                    raise Exception("Git user info not set")
+                filter_cmd += "echo 'Signed-off-by: %s <%s>'" % \
+                        (name.decode().strip(), email.decode().strip())
+            if filter_cmd:
+                subprocess.check_output(["git", "filter-branch", "-f",
+                                         "--msg-filter", "cat; " + filter_cmd,
+                                         "HEAD~1.."], cwd=repo)
+        if tag:
+            subprocess.check_call(["git", "tag", "-f",
+                                  tag.replace("%m", msgid)], cwd=repo,
+                                  stdout=logf, stderr=logf)
+
+    def _push(self, repo, remote, tag, logf):
+        subprocess.check_call(["git", "remote", "add", "push_to", remote],
+                              cwd=repo, stdout=logf, stderr=logf)
+        subprocess.check_call(["git", "push", "-f", "push_to",
+                               "%s:refs/tags/%s" % (tag, tag)],
+                              cwd=repo, stdout=logf, stderr=logf)
+
+    def _applier_mode(self, args):
+        toapply = self.api_do("applier-get")
+        if not toapply:
+            print("No series need apply")
+            return 3
+        logf = tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8")
+        push_repo = toapply.get("git.push_to")
+        public_repo = toapply.get("git.public_repo")
+        wd = tempfile.mkdtemp(dir="/var/tmp")
+        try:
+            if toapply.get("git.repo"):
+                remote, head = toapply["git.repo"], toapply["git.base"]
+                git_clone_repo(wd, remote, head, sys.stdout)
+            else:
+                project_git = toapply["project.git"]
+                if " " in project_git:
+                    remote, head = project_git.split(" ", 2)
+                else:
+                    remote, head = project_git, "master"
+                git_clone_repo(wd, remote, "origin/" + head, sys.stdout)
+            branch = toapply["message-id"]
+            force_branch = None
+            tag = "patchew/" + toapply["message-id"]
+            base = subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                           cwd=wd).decode('utf-8') \
+                    .strip()
+            self._apply(wd, toapply, branch, force_branch, tag, logf)
+            if push_repo:
+                self._push(wd, push_repo, tag, logf)
+            url = toapply.get("git.url_template", "").replace("%t", tag)
+        except Exception as e:
+            if not isinstance(e, ApplyFailedException):
+                traceback.print_exc(file=logf)
+            logf.seek(0)
+            log = logf.read()
+            if push_repo:
+                log = log.replace(push_repo, public_repo)
+            print(log)
+            self.api_do("applier-report",
+                        project=toapply["project"],
+                        message_id=toapply["message-id"],
+                        tag=None, url=None, base=None, repo=None,
+                        failed=True, log=log)
+            return 1
+        finally:
+            shutil.rmtree(wd)
+        logf.seek(0)
+        log = logf.read()
+        if push_repo:
+            log = log.replace(push_repo, public_repo)
+        self.api_do("applier-report",
+                    project=toapply["project"],
+                    message_id=toapply["message-id"],
+                    tag=tag, url=url, base=base, repo=public_repo,
+                    failed=False, log=log)
+        return 0
+
+    def do(self, args, argv):
+        if args.applier_mode:
+            if args.repo or args.branch or args.force_branch or args.tag:
+                print("--applier-mode conflicts with -C, -b, -B and -t")
+                return 1
+            return self._applier_mode(args)
+        r = self.api_do("search", terms=args.term)
+        if not r:
+            print("Nothing to apply")
+            return 3
+        if len(r) > 1 and not args.any:
+            print("More than one series matched:")
+            for p in r:
+                print(p["project"], p["subject"])
+            return 1
+        if not r[0]["is_complete"]:
+            print("Series not complete")
+            return 1
+        def mformat(a):
+            return a.replace("%m", r[0]["message-id"]) if a else a
+        try:
+            self._apply(args.repo, r[0],
+                        mformat(args.branch),
+                        mformat(args.force_branch),
+                        mformat(args.tag),
+                        signoff=args.signoff)
+            return 0
+        except:
+            traceback.print_exc()
+            return 1
+
+
+def global_args(parser):
+    parser.add_argument("-d", "--debug", action="store_true", default=None,
+                        help="Enable debug output")
+    parser.add_argument("-D", "--nodebug", action="store_false", dest="debug",
+                        help="Disable debug output")
+    parser.add_argument("-s", "--server",
+                        help="Base URL for patchew server")
+    parser.add_argument("-c", "--config",
+                        help="""Config file to use. Default is to look up
+                        .patchew.cfg under current directory and $HOME""")
+
+def args_merge_config(args):
+    if not args.config:
+        for fp in [".patchew.cfg", os.path.expanduser("~/.patchew.cfg")]:
+            if os.path.isfile(fp):
+                args.config = fp
+                break
+    if not args.config:
+        return
+    cp = configparser.ConfigParser()
+    cp.read(args.config)
+    if args.debug == None:
+        args.debug = cp.getboolean("general", "debug")
+    if args.server == None:
+        args.server = cp.get("general", "server")
+
+def main():
+    parser = argparse.ArgumentParser()
+    global_args(parser)
+    subparsers = parser.add_subparsers(title="subcommands")
+    for c in SubCommand.__subclasses__():
+        cmd = c()
+        p = subparsers.add_parser(cmd.name, help=cmd.help)
+        if hasattr(cmd, "arguments"):
+            cmd.arguments(p)
+        p.set_defaults(cmdobj=cmd, all=False)
+    args, argv = parser.parse_known_args()
+
+    args_merge_config(args)
+
+    if not hasattr(args, "cmdobj"):
+        parser.print_usage()
+        return 1
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG)
+        logging.debug("Server: %s", args.server)
+    if argv and not args.cmdobj.want_argv:
+        raise Exception("Unrecognized arguments:\n" + argv[0])
+    base_url = args.server or "https://patchew.org"
+    if base_url.endswith("/"):
+        base_url = base_url[:-1]
+    args.cmdobj.base_url = base_url
+    try:
+        return args.cmdobj.do(args, argv)
+    except KeyboardInterrupt:
+        raise
+
+if __name__ == '__main__':
+    sys.exit(main())
+

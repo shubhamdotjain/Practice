@@ -1,0 +1,15 @@
+@media (min-width: 1200px) {
+  .project-logo {
+	background: white;
+	padding: 1em;
+	float: right;
+  }
+}
+.project-logo {
+	display: block;
+	padding-bottom: 1em;
+}
+
+.project-description {
+	margin-bottom: 1em;
+}

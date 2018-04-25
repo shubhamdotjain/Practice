@@ -1,6 +1,3 @@
-<<<<<<< HEAD
-.ipynb_che*
-=======
 /wsgi/static/*
 __pycache__
 *.pyc
@@ -8,4 +5,3 @@ __pycache__
 /venv
 /patchew-db-small.tar.xz
 /scripts/playbooks/*.retry
->>>>>>> 5e3bc944cc1932ffaffcb9246ee55fa213ee9a29

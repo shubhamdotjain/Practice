@@ -1,0 +1,122 @@
+#!/bin/bash
+#
+# Copyright 2016 Red Hat, Inc.
+#
+# Authors:
+#     Fam Zheng <famz@redhat.com>
+#
+# This work is licensed under the MIT License.  Please see the LICENSE file or
+# http://opensource.org/licenses/MIT.
+
+set -e
+
+. /data/patchew/config
+
+BASEDIR="/data/patchew"
+
+PATCHEW_CLI="/opt/patchew/patchew-cli -s $PATCHEW_SERVER"
+
+offlineimap_rc=$BASEDIR/offlineimap.rc
+maildir="$BASEDIR/maildir"
+mkdir -p $maildir
+
+type offlineimap 1>/dev/null
+type md5sum 1>/dev/null
+
+cat >$offlineimap_rc <<EOF
+[general]
+accounts = main
+
+[Account main]
+# Identifier for the local repository; e.g. the maildir to be synced via IMAP.
+localrepository = main-local
+# Identifier for the remote repository; i.e. the actual IMAP, usually non-local.
+remoterepository = main-remote
+# Status cache. Default is plain, which eventually becomes huge and slow.
+status_backend = sqlite
+
+[Repository main-local]
+# Currently, offlineimap only supports maildir and IMAP for local repositories.
+type = Maildir
+# Where should the mail be placed?
+localfolders = $maildir
+
+[Repository main-remote]
+# Remote repos can be IMAP or Gmail, the latter being a preconfigured IMAP.
+type = IMAP
+remotehost = $IMAP_SERVER
+remoteuser = $IMAP_USER
+remotepass = $IMAP_PASS
+ssl= yes
+folderfilter = lambda foldername: foldername in [
+    $(for x in $IMAP_FOLDERS; do printf "'$x',"; done)
+    ]
+EOF
+
+if test -n "$IMAP_CERT_FINGERPRINT"; then
+  echo "cert_fingerprint = $IMAP_CERT_FINGERPRINT" >>$offlineimap_rc
+elif test -n "$SSL_CACERT_PATH"; then
+  echo "sslcacertfile = $SSL_CACERT_PATH" >> $offlineimap_rc
+fi
+
+IMPORTED_DIR=$BASEDIR/imported
+mkdir -p $IMPORTED_DIR
+
+BAD_MESSAGES_DIR=$BASEDIR/bad-messages
+mkdir -p $BAD_MESSAGES_DIR
+
+hashstr()
+{
+    echo $@ | md5sum - | cut -f 1 -d \ 
+}
+
+imported()
+{
+    test -f $IMPORTED_DIR/$(hashstr $@)
+}
+
+import()
+{
+    echo import $@
+    if ! timeout -k 600 600 $PATCHEW_CLI import $@; then
+        cp $@ $BAD_MESSAGES_DIR
+        echo "(bad message saved in $BAD_MESSAGES_DIR)"
+    fi
+    if test "$IMAP_DELETE_AFTER_IMPORT" = y; then
+        rm -f $f
+        echo "Deleted $f"
+    fi
+    touch $IMPORTED_DIR/$(hashstr $@)
+}
+
+offlineimap_import()
+{
+    if ! timeout -k 2000 1800 offlineimap -c $offlineimap_rc; then
+        sleep 300
+        return
+    fi
+    find "$maildir" -type f | while read f; do
+        if imported "$f"; then
+            return
+        fi
+        import "$f" || true
+    done
+}
+
+while :; do
+    $PATCHEW_CLI login "$PATCHEW_USER" "$PATCHEW_PASS"
+    offlineimap_import
+    while :; do
+        wd=$(mktemp -d /var/tmp/patchew-applier.XXXXX)
+        if (cd $wd; $PATCHEW_CLI apply --applier-mode); then
+            rm -rf $wd
+        elif [ $? -eq 3 ]; then
+            rm -rf $wd
+            break
+        else
+            rm -rf $wd
+        fi
+    done
+    $PATCHEW_CLI project update
+    sleep 60
+done

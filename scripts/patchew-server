@@ -1,0 +1,19 @@
+#!/bin/sh
+
+set -e
+export logdir=$PATCHEW_DATA_DIR/log
+mkdir -p $logdir
+
+chown -R nginx:nginx $PATCHEW_DATA_DIR
+cd /opt/patchew
+
+. venv/bin/activate
+
+./manage.py migrate --noinput
+./manage.py collectstatic --noinput
+
+gunicorn -b unix:/data/patchew/gunicorn.sock -D wsgi \
+    --error-logfile $logdir/gunicorn-error.log \
+    --access-logfile $logdir/gunicorn-access.log
+rm -f /data/patchew/nginx.sock
+nginx -c $(readlink -e scripts/patchew-server.nginx.conf)

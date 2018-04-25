@@ -1,6 +1,3 @@
-<<<<<<< HEAD
-# Practice
-=======
 # Patchew Documentation
 
 ## About
@@ -42,4 +39,3 @@ discussion mailing list, patchew-devel@redhat.com.
 ## License
 
 See LICENSE file.
->>>>>>> 5e3bc944cc1932ffaffcb9246ee55fa213ee9a29
